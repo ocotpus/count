@@ -13,15 +13,6 @@ class WriteApiController
 {
     use Helpers;
 
-    protected $list;
-    protected $getCouponRecordList;
-
-    public function __construct()
-    {
-        $this->list = DB::table('coupons')->where('status',1)->get();
-        $this->getCouponRecordList = DB::table('get_coupon_records')->get();
-    }
-
     /**
      * 抽奖
      */
@@ -29,40 +20,43 @@ class WriteApiController
     {
         $redis = Redis::connection('coupon');
         try {
-//            $id = $request->input('id');
-            $id = '555555555';
-            //抽奖，得到本次抽奖概率
-
+            $id = $request->input('id');
+//            $id = '555555555';
+            //查看是否已经抽过奖
             $isDrawThePrize = $this->checkPrize($id);
             if ($isDrawThePrize === false) {
-                return $this->response->array(['status' => '200', 'msg' => '您已经抽过奖了']);
+                $couponInfo = DB::table('coupons')->select('id', 'discount_code')->where('status',2)->where('get_coupon_id', $id)->first();
+                if ($couponInfo) {
+                    return $this->response->array(['code' => '0', 'coupon' => $couponInfo->discount_code]);
+                }
+                return $this->response->array(['code' => '1']);
             } else {
                 $this->addGetCouponRecord($id);
             }
+            //抽奖，得到本次抽奖概率
             $probability = $this->getProbability();
             if ($probability)  {
-                //检查这个奖品数量是否被抽完，如果抽完，重新抽奖返回奖品信息，直到抽到有存量奖品;所有奖品都抽完，返回false
+                //检查这个奖品数量是否被抽完
                 $couponNum = $this->checkCouponNum();
                 if(false === $couponNum) {
-                    return $this->response->array(['status' => '200','msg' => '来晚了！优惠券已被洗劫一空！']);
+                    return $this->response->array(['code' => '1']);
+                } else {
+                    //获取第一条未抽中的优惠券字段
+                    $couponId = DB::table('coupons')->select('id', 'discount_code')->where('status',1)->first();
+                    //更新coupon表中奖ID字段
+                    DB::table('coupons')->where('id', $couponId->id)->update(['get_coupon_id' => $id, 'status'=> 2, 'updated_at' => date('Y-m-d H:i:s')]);
+                    $info = DB::table('coupons')->select('discount_code')->where('id', $couponId->id)->first();
+                    //删除redis中该id的缓存
+                    $redis->del($couponId->discount_code);
+                    //写抽奖记录
+                    return $this->response->array(['code' => '0', 'coupon:' => $info->discount_code]);
                 }
-                DB::begintransAction();
-                //获取第一条未抽中的优惠券字段
-                $couponId = DB::table('coupons')->select('id', 'discount_code')->where('status',1)->first();
-                //更新coupon表中奖ID字段
-                $info = DB::table('coupons')->where('id', $couponId->id)->update(['get_coupon_id' => $id, 'status'=> 2]);
-                //删除redis中该id的缓存
-                $redis->del($couponId->discount_code);
-                //写抽奖记录
-                DB::commit();
-                return $this->response->array(['status' => '200', 'msg'=> '成功', 'data' => $info]);
             } else {
-                return $this->response->array(['status' => '200', 'msg' => '未中奖']);
+                return $this->response->array(['code' => '1']);
             }
         } catch (\Exception $e) {
-            DB::rollBack();
             \Log::error($e->getMessage());
-            return $this->response->array(['status' => '400', 'msg' => '未中奖']);
+            return $this->response->array(['code' => '2']);
         }
     }
 
@@ -83,21 +77,28 @@ class WriteApiController
     private function checkCouponNum()
     {
         $redis = Redis::connection('coupon');
-        if (!empty($this->list)) {
-            foreach ($this->list as $key => $l) {
-                $redis->set($l->discount_code, $key);
+        if (empty($redis->keys('*'))) {
+            $list = DB::table('coupons')->where('status',1)->get()->toArray();
+            if (!empty($list)) {
+                foreach ($list as $key => $l) {
+                    $redis->set($l->discount_code, $key);
+                }
+                return true;
             }
-            return true;
+            return false;
         }
-        return false;
+        return true;
     }
 
     /**
-     * 写入抽奖信息记录到get_coupon_records表
+     * 写入抽奖信息记录到get_coupon_records表并加入redis缓存
      */
     private function addGetCouponRecord($id)
     {
-        return GetCouponRecord::query()->create(['device_id' => $id]);
+        $redis = Redis::connection('get_coupon_record');
+        $data = GetCouponRecord::query()->create(['device_id' => $id]);
+        $redis->set($id, $data->id);
+        return $data;
     }
 
     /**
@@ -106,14 +107,6 @@ class WriteApiController
     public function checkPrize($id)
     {
         $redis = Redis::connection('get_coupon_record');
-        if (!empty($this->getCouponRecordList)) {
-            foreach ($this->getCouponRecordList as $key => $l) {
-                $redis->set($l->device_id, $key);
-            }
-        }
-        if ($redis->get($id) === null) {
-            return true;
-        };
-        return false;
+        return $redis->get($id) === null ? true : false;
     }
 }
